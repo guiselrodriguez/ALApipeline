@@ -45,6 +45,13 @@ import sys
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
+from fpdf import FPDF
+from reportlab.lib.pagesizes import letter
+from reportlab.pdfgen import canvas
+# importing packages to create a pdf. ReportLab best for PDF customization
+
+
+
 try:
     import openpyxl
 except ImportError:
