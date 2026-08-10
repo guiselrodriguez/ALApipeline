@@ -42,6 +42,9 @@ import json
 import os
 import re
 import sys
+import shutil
+import tempfile
+import zipfile
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
@@ -50,10 +53,7 @@ try:
 except ImportError:
     openpyxl = None  # only needed for the house-charac and ogawa subcommands
 
-
-PST = timezone(timedelta(hours=-8))  # fixed UTC-8 convention used throughout this pipeline
-
-FIELDS = ["house_id", "date", "timestamp_pst", "instrument", "variable", "value", "unit", "qc_flag"]
+PST = timezone(timedelta(hours=-8))  # fixed UTC-8 
 
 # Full code list per https://tsi.com/resources/airassure-iaq-monitors-faqs
 # (the design doc's "common codes" list only covers the first 7 general codes,
@@ -128,7 +128,11 @@ FNAME_RE = re.compile(r"^[Hh](\d+)_[Ww](\d+)_(.+)\.(csv|txt|json)$")
 
 def discover_groups(folder):
     groups = defaultdict(dict)
-    for path in sorted(glob.glob(os.path.join(folder, "*"))):
+    # recursive so it doesn't matter how deep the actual files are nested --
+    # Drive downloads often wrap them in an extra subfolder or two
+    for path in sorted(glob.glob(os.path.join(folder, "**", "*"), recursive=True)):
+        if os.path.isdir(path):
+            continue
         base = os.path.basename(path)
         m = FNAME_RE.match(base)
         if not m:
@@ -159,6 +163,30 @@ def discover_groups(folder):
     return groups
 
 
+def resolve_input_path(path, temp_dirs):
+    """
+    Accepts either a folder or a .zip file. If it's a zip, extracts it to a
+    temporary directory (so the zip itself never has to be manually
+    unzipped/kept around) and returns that temp path instead. Every temp
+    dir created gets appended to temp_dirs, so the caller can clean them up
+    afterward with cleanup_temp_dirs() -- extraction is temporary, not a
+    second permanent copy sitting next to the zip.
+    """
+    if os.path.isfile(path) and path.lower().endswith(".zip"):
+        temp_dir = tempfile.mkdtemp(prefix="hbrl_")
+        print(f"Extracting {path} -> {temp_dir} (temporary, removed after processing)")
+        with zipfile.ZipFile(path) as zf:
+            zf.extractall(temp_dir)
+        temp_dirs.append(temp_dir)
+        return temp_dir
+    return path
+
+
+def cleanup_temp_dirs(temp_dirs):
+    for d in temp_dirs:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def pt_number(path):
     m = re.search(r"pt(\d+)", os.path.basename(path), re.IGNORECASE)
     return int(m.group(1)) if m else 999
@@ -178,13 +206,13 @@ def parse_anemometer_rows(path):
             if not re.match(r"^\d{2}-\d{2}-\d{4}$", date_s):
                 continue
             try:
-                dt = datetime.strptime(f"{date_s} {time_s}", "%d-%m-%Y %H:%M:%S")
+                dt_local = datetime.strptime(f"{date_s} {time_s}", "%d-%m-%Y %H:%M:%S")
                 value = float(parts[1])
             except ValueError:
                 continue
+            dt = dt_local.replace(tzinfo=PST).astimezone(timezone.utc).replace(tzinfo=None)
             rows.append((dt, value))
     return rows
-
 
 def detect_gaps(label, house_num, week_num, timestamps, min_gap_minutes=15):
     ts_sorted = sorted(set(timestamps))
@@ -196,10 +224,11 @@ def detect_gaps(label, house_num, week_num, timestamps, min_gap_minutes=15):
     for a, b in zip(ts_sorted, ts_sorted[1:]):
         gap = (b - a).total_seconds()
         if gap > threshold:
-            date_str = a.strftime("%m/%d") if a.date() == b.date() else f"{a.strftime('%m/%d')}-{b.strftime('%m/%d')}"
+            a_pst, b_pst = a - timedelta(hours=8), b - timedelta(hours=8)
+            date_str = a_pst.strftime("%m/%d") if a_pst.date() == b_pst.date() else f"{a_pst.strftime('%m/%d')}-{b_pst.strftime('%m/%d')}"
             print(
                 f"House {house_num} Week {week_num} {label}: no data on {date_str} "
-                f"between {fmt_time(a)} and {fmt_time(b)}"
+                f"between {fmt_time(a_pst)} and {fmt_time(b_pst)} PST"
             )
 
 
@@ -236,12 +265,12 @@ def parse_atmocube(path):
                 epoch = int(ts)
             except ValueError:
                 continue
-            dt_pst = datetime.fromtimestamp(epoch, tz=timezone.utc).astimezone(PST).replace(tzinfo=None)
+            dt_utc = datetime.fromtimestamp(epoch, tz=timezone.utc).replace(tzinfo=None)
             for col, (var, unit) in ATMOCUBE_MAP.items():
                 val = r.get(col)
                 if val in (None, ""):
                     continue
-                rows.append((dt_pst, var, val, unit, "ok"))
+                rows.append((dt_utc, var, val, unit, "ok"))
     return rows
 
 
@@ -268,9 +297,10 @@ def parse_kestrel(path):
             raw_ts = r.get(ts_col) if ts_col else None
             if not raw_ts:
                 continue
-            dt = parse_flexible_datetime(raw_ts)
-            if dt is None:
+            dt_local = parse_flexible_datetime(raw_ts)
+            if dt_local is None:
                 continue
+            dt = dt_local.replace(tzinfo=PST).astimezone(timezone.utc).replace(tzinfo=None)
             if temp_c_col and r.get(temp_c_col) not in (None, ""):
                 rows.append((dt, "temperature", r[temp_c_col], "C", "ok"))
             elif temp_f_col and r.get(temp_f_col) not in (None, ""):
@@ -297,9 +327,10 @@ def parse_aranet(path):
             if not raw_ts:
                 continue
             try:
-                dt = datetime.strptime(raw_ts.strip(), "%d/%m/%Y %I:%M:%S %p")
+                 dt_local = datetime.strptime(raw_ts.strip(), "%d/%m/%Y %I:%M:%S %p")
             except ValueError:
                 continue
+            dt = dt_local.replace(tzinfo=PST).astimezone(timezone.utc).replace(tzinfo=None)
             if co2_col and r.get(co2_col) not in (None, ""):
                 rows.append((dt, "co2", r[co2_col], "ppm", "ok"))
             if temp_col and r.get(temp_col) not in (None, ""):
@@ -324,9 +355,8 @@ def parse_geocene(path, side):
         val = entry.get("value")
         if not raw_ts or val is None:
             continue
-        dt_utc = datetime.strptime(raw_ts[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
-        dt_pst = dt_utc.astimezone(PST).replace(tzinfo=None)
-        rows.append((dt_pst, var, val, "C", "ok"))
+        dt_utc = datetime.strptime(raw_ts[:19], "%Y-%m-%dT%H:%M:%S")
+        rows.append((dt_utc, var, val, "C", "ok"))
     return rows
 
 
@@ -352,8 +382,8 @@ def parse_hobo(path):
             dt_local = datetime.strptime(raw_ts, "%m/%d/%y %I:%M:%S %p")
         except ValueError:
             continue
-        dt_pst = dt_local.replace(tzinfo=hobo_tz).astimezone(PST).replace(tzinfo=None)
-        rows.append((dt_pst, "power", raw_pow, "W", "ok"))
+        dt_utc = dt_local.replace(tzinfo=hobo_tz).astimezone(timezone.utc).replace(tzinfo=None)
+        rows.append((dt_utc, "power", raw_pow, "W", "ok"))
     return rows
 
 
@@ -410,14 +440,13 @@ def parse_airassure(paths, house_num, week_num):
         if not raw_ts:
             continue
         try:
-            dt_utc = datetime.strptime(raw_ts, "%m/%d/%Y %H:%M").replace(tzinfo=timezone.utc)
+            dt_utc = datetime.strptime(raw_ts, "%m/%d/%Y %H:%M")
         except ValueError:
             continue
-        dt_pst = dt_utc.astimezone(PST).replace(tzinfo=None)
-        if dt_pst in seen_ts:
+        if dt_utc in seen_ts:
             continue
-        seen_ts.add(dt_pst)
-        all_ts.append(dt_pst)
+        seen_ts.add(dt_utc)
+        all_ts.append(dt_utc)
 
         try:
             sys_status = int(rec.get("System Status") or 0)
@@ -427,7 +456,7 @@ def parse_airassure(paths, house_num, week_num):
         # code 4 (cloud disconnected) is expected -- device has no wifi -- so it's not an error on its own
         sys_flags_reportable = [f for f in sys_flags if f != "cloud_disconnected"]
         if sys_flags_reportable:
-            ts_errors[dt_pst].append("system: " + "+".join(sys_flags_reportable))
+            ts_errors[dt_utc].append("system: " + "+".join(sys_flags_reportable))
 
         for col, var in AIRASSURE_VAR_MAP.items():
             val = rec.get(col)
@@ -439,23 +468,22 @@ def parse_airassure(paths, house_num, week_num):
             except ValueError:
                 status_val = 0
             flags = decode_bits(status_val, STATUS_COL_BITMAP[status_col])
-            if status_val != 0 and f"{var}: " + "+".join(flags) not in ts_errors[dt_pst]:
-                ts_errors[dt_pst].append(f"{var}: " + "+".join(flags))
+            if status_val != 0 and f"{var}: " + "+".join(flags) not in ts_errors[dt_utc]:
+                ts_errors[dt_utc].append(f"{var}: " + "+".join(flags))
             qc_parts = flags + sys_flags_reportable
             qc = "+".join(qc_parts) if qc_parts else "ok"
             unit = units.get(col, "")
-            rows.append((dt_pst, var, val, unit, qc))
+            rows.append((dt_utc, var, val, unit, qc))
 
-    for dt_pst in sorted(ts_errors):
-        reasons = "; ".join(ts_errors[dt_pst])
+    for dt_utc in sorted(ts_errors):
+        reasons = "; ".join(ts_errors[dt_utc])
+        dt_pst_display = dt_utc - timedelta(hours=8)
         print(
-            f"House {house_num} Week {week_num} AirAssure at {fmt_time(dt_pst)} on "
-            f"{dt_pst.strftime('%Y-%m-%d')} had an error: {reasons}"
+            f"House {house_num} Week {week_num} AirAssure at {fmt_time(dt_pst_display)} on "
+            f"{dt_pst_display.strftime('%Y-%m-%d')} PST had an error: {reasons}"
         )
-
     detect_gaps("AirAssure", house_num, week_num, all_ts)
     return rows
-
 
 
 # House characteristics table ( per-house metadata, not a timeseries)
@@ -698,15 +726,17 @@ def load_visit_dates(house_charac_file):
     ws = wb["Sheet1"]
     header_row = [cell.value for cell in ws[2]]
     idx = {name: i for i, name in enumerate(header_row) if name in ("House", "Visit 1", "Visit 2", "Visit 3")}
+    def to_utc(v):
+        return v.replace(tzinfo=PST).astimezone(timezone.utc).replace(tzinfo=None) if v else None
 
     visits = {}
     for row in ws.iter_rows(min_row=3, values_only=True):
         house_id = row[idx["House"]] if "House" in idx else None
         if not house_id:
             continue
-        v1 = row[idx["Visit 1"]] if "Visit 1" in idx else None
-        v2 = row[idx["Visit 2"]] if "Visit 2" in idx else None
-        v3 = row[idx["Visit 3"]] if "Visit 3" in idx else None
+        v1 = to_utc(row[idx["Visit 1"]] if "Visit 1" in idx else None)
+        v2 = to_utc(row[idx["Visit 2"]] if "Visit 2" in idx else None)
+        v3 = to_utc(row[idx["Visit 3"]] if "Visit 3" in idx else None)
         visits[str(house_id).strip()] = (v1, v2, v3)
     return visits
 
@@ -750,10 +780,10 @@ def process_house(house_num, week_groups, house_charac_file, output_folder):
         return None
 
     pre_window, post_window = compute_phase_windows(v1, v2, v3)
-    print("  PRE/POST WINDOWS (from House_charac Visit 1/2/3, not Anemometer):")
-    print(f"    pre:  {pre_window[0]}  ->  {pre_window[1]}")
-    print(f"    post: {post_window[0]}  ->  {post_window[1]}")
-    print(f"    (visit + buffer excluded: {pre_window[1]} -> {post_window[0]})")
+    print("  PRE/POST WINDOWS (from House_charac Visit 1/2/3, converted to true UTC):")
+    print(f"    pre:  {pre_window[0]} UTC  ->  {pre_window[1]} UTC")
+    print(f"    post: {post_window[0]} UTC  ->  {post_window[1]} UTC")
+    print(f"    (visit + buffer excluded: {pre_window[1]} -> {post_window[0]} UTC)")
     print("-" * 42)
 
     out_rows = []
@@ -819,7 +849,7 @@ def process_house(house_num, week_groups, house_charac_file, output_folder):
 
     out_name = f"{house_id}.csv"
     out_path = os.path.join(output_folder, out_name)
-    fields = ["house_id", "phase", "date", "timestamp_pst", "instrument", "variable", "value", "unit", "qc_flag"]
+    fields = ["house_id", "phase", "date", "timestamp_utc", "instrument", "variable", "value", "unit", "qc_flag"]
     with open(out_path, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(fields)
@@ -854,7 +884,7 @@ def build_arg_parser():
         help="Process a house's raw instrument folders into ONE combined table, tagged pre/post using House_charac visit dates",
     )
     sensors_p.add_argument("house_charac_file", help="Path to the House Characteristics .xlsx file (used for pre/post windows, not Anemometer)")
-    sensors_p.add_argument("input_folders", nargs="+", help="One or more week folders for the SAME house, e.g. the week1 folder and the week2 folder")
+    sensors_p.add_argument("input_folders", nargs="+", help="One or more week folders (or .zip files) for the SAME house, e.g. the week1 folder/zip and the week2 folder/zip")
     sensors_p.add_argument(
         "--output", default=None,
         help='Where to write H<N>.csv (default: an "output" folder next to this script)',
@@ -896,25 +926,30 @@ def main():
     args = build_arg_parser().parse_args()
 
     if args.command == "sensors":
-        all_groups = defaultdict(dict)  # (house_num, week_num) -> files, merged across all input folders
-        for folder in args.input_folders:
-            groups = discover_groups(folder)
-            for key, files in groups.items():
-                all_groups[key].update(files)
-        if not all_groups:
-            print(f"No h<N>_w<M>_... files found in: {', '.join(args.input_folders)}")
-            sys.exit(1)
+        temp_dirs = []
+        try:
+            all_groups = defaultdict(dict)  # (house_num, week_num) -> files, merged across all input folders
+            for folder in args.input_folders:
+                resolved = resolve_input_path(folder, temp_dirs)
+                groups = discover_groups(resolved)
+                for key, files in groups.items():
+                    all_groups[key].update(files)
+            if not all_groups:
+                print(f"No h<N>_w<M>_... files found in: {', '.join(args.input_folders)}")
+                sys.exit(1)
 
-        # Re-group by house only, since output is now one combined file per house
-        by_house = defaultdict(dict)  # house_num -> {week_num: files}
-        for (house_num, week_num), files in all_groups.items():
-            by_house[house_num][week_num] = files
+            # Re-group by house only, since output is now one combined file per house
+            by_house = defaultdict(dict)  # house_num -> {week_num: files}
+            for (house_num, week_num), files in all_groups.items():
+                by_house[house_num][week_num] = files
 
-        output_folder = args.output or DEFAULT_OUTPUT_FOLDER
-        os.makedirs(output_folder, exist_ok=True)
-        print(f"Writing output to {output_folder}")
-        for house_num in sorted(by_house):
-            process_house(house_num, by_house[house_num], args.house_charac_file, output_folder)
+            output_folder = args.output or DEFAULT_OUTPUT_FOLDER
+            os.makedirs(output_folder, exist_ok=True)
+            print(f"Writing output to {output_folder}")
+            for house_num in sorted(by_house):
+                process_house(house_num, by_house[house_num], args.house_charac_file, output_folder)
+        finally:
+            cleanup_temp_dirs(temp_dirs)
 
     elif args.command == "house-charac":
         output_folder = args.output_folder or DEFAULT_OUTPUT_FOLDER

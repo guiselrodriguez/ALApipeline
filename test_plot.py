@@ -3,10 +3,13 @@ Stacked plot generator -- reads a standardized H<N>.csv (the output of
 process_hbrl_data.py's `sensors` command) and produces one figure with
 a stacked subplot for each variable you ask for.
 
-The x-axis is always time (timestamp_pst) -- that's fixed by design,
-since the whole point of stacking panels is to visually line up spikes
-across different signals on the same timeline. Only the y-axis (which
-variables to show) is something you choose.
+The underlying table stores timestamp_utc (true UTC). This script converts
+to PST 
+
+The x-axis is always time -- that's fixed by design, since the whole point
+of stacking panels is to visually line up spikes across different signals
+on the same timeline. Only the y-axis (which variables to show) is
+something you choose.
 
 Because several instruments measure the same thing (e.g. co2 shows up
 from Atmocube, AirAssure, AND Aranet), each y-axis series needs to be
@@ -20,23 +23,62 @@ Usage:
 
 import argparse
 import sys
+from datetime import timedelta
 import pandas as pd
 import matplotlib.pyplot as plt
+
+AVAILABLE_SERIES = {
+    "Atmocube": ["co2", "pm1", "pm25", "pm4", "pm10", "temperature", "humidity",
+                 "absolute_humidity", "pressure", "noise", "light", "ch2o", "voc_index", "nox_index"],
+    "AirAssure": ["co2", "co", "no2", "o3", "so2", "pm1", "pm25", "pm4", "pm10",
+                  "temperature", "humidity", "pressure", "etoh", "tvoc"],
+    "Geocene": ["stove_temp_left", "stove_temp_right"],
+    "Hobo": ["power"],
+    "Anemometer": ["hood_airflow"],
+    "Kestrel": ["temperature", "humidity"],
+    "Aranet": ["co2", "temperature", "humidity", "pressure"],
+}
+
+
+def usage_banner():
+    lines = [
+        "",
+        "HOW TO USE THIS SCRIPT",
+        "-----------------------",
+        "Example:",
+        '  python test_plot.py H1.csv --y "Atmocube:co2" "Geocene:stove_temp_left" "Anemometer:hood_airflow"',
+        "",
+        "Each --y entry is written as \"Instrument:variable\" (see the list below for valid options).",
+        "Every entry becomes its own stacked panel, sharing the same time axis (shown in PST).",
+        "",
+        "Optional flags:",
+        "  --phase pre        only show the pre period",
+        "  --phase post        only show the post period",
+        "  --output name.png   name the saved image (default: stack_plot.png)",
+        "",
+        "Available Instrument:variable options:",
+    ]
+    for instrument, variables in AVAILABLE_SERIES.items():
+        lines.append(f"  {instrument}: " + ", ".join(variables))
+    lines.append("")
+    return "\n".join(lines)
 
 
 def load_series(df, instrument, variable, phase=None):
     mask = (df["instrument"] == instrument) & (df["variable"] == variable)
     if phase:
         mask &= df["phase"] == phase
-    sub = df[mask].sort_values("timestamp_pst")
+    sub = df[mask].sort_values("timestamp_pst_display")
     if sub.empty:
         return None, None, None
     unit = sub["unit"].iloc[0]
-    return sub["timestamp_pst"], sub["value"], unit
+    return sub["timestamp_pst_display"], sub["value"], unit
 
 
 def make_stack_plot(csv_file, y_series, phase=None, output="stack_plot.png"):
-    df = pd.read_csv(csv_file, parse_dates=["timestamp_pst"])
+    df = pd.read_csv(csv_file, parse_dates=["timestamp_utc"])
+    # Fixed UTC-8, for display only -- the CSV itself stays in true UTC
+    df["timestamp_pst_display"] = df["timestamp_utc"] - timedelta(hours=8)
 
     fig, axes = plt.subplots(len(y_series), 1, figsize=(12, 3 * len(y_series)), sharex=True)
     if len(y_series) == 1:
@@ -54,7 +96,7 @@ def make_stack_plot(csv_file, y_series, phase=None, output="stack_plot.png"):
         ax.set_title(f"{instrument}: {variable}")
         ax.grid(alpha=0.3)
 
-    axes[-1].set_xlabel("Time")
+    axes[-1].set_xlabel("Time (PST)")
     if phase:
         fig.suptitle(f"Phase: {phase}", fontsize=13, fontweight="bold")
     plt.tight_layout()
@@ -72,7 +114,11 @@ def parse_series_arg(raw):
 
 
 def build_arg_parser():
-    parser = argparse.ArgumentParser(description="Build a stacked time-series plot from a standardized H<N>.csv file")
+    parser = argparse.ArgumentParser(
+        description="Build a stacked time-series plot from a standardized H<N>.csv file",
+        epilog=usage_banner(),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument("csv_file", help="Path to the H<N>.csv file (output of the sensors command)")
     parser.add_argument("--y", nargs="+", required=True,
                          help='One or more "Instrument:variable" pairs, e.g. --y "Atmocube:co2" "Geocene:stove_temp_left"')
@@ -83,6 +129,9 @@ def build_arg_parser():
 
 
 if __name__ == "__main__":
+    print(usage_banner())
+    if len(sys.argv) == 1:
+        sys.exit(0)
     args = build_arg_parser().parse_args()
     y_series = [parse_series_arg(s) for s in args.y]
     make_stack_plot(args.csv_file, y_series, phase=args.phase, output=args.output)
