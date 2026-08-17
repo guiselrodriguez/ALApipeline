@@ -563,13 +563,13 @@ def build_house_characteristics(source_file, output_folder, house_filter=None):
 
 # Ogawa NO2 table (weekly integrated badge samples, not a timeseries either)
 
-
-OGAWA_COL_TO_LOCATION = {
-    "C": "kitchen_near_stove",
-    "D": "kitchen_far_stove",
-    "E": "living_room",
-    "F": "outdoors",
-    "G": "bedroom",
+OGAWA_RAW_COL_TO_LOCATION = {
+    "Ogawa_1": "kitchen_near_stove",
+    "Ogawa_2": "kitchen_far_stove",
+    "Ogawa_3": "living_room",
+    "Ogawa_4": "bedroom",
+    "Ogawa_5_Outside": "outdoors",
+    "Ogawa_6_FB": "field_blank",
 }
 OGAWA_PLACEMENT_COL_TO_LOCATION = {
     "F": "kitchen_near_stove",
@@ -599,109 +599,49 @@ def _load_ogawa_placement_descriptions(placement_file):
     return descriptions
 
 
-def _classify_ogawa_week_cell(raw):
-    if raw is None:
-        return None, None
-    if isinstance(raw, (int, float)):
-        return int(raw), "raw"
-    m = re.match(r"^(\d+)\s*\(subtracting outside\)", str(raw).strip().lower())
-    if m:
-        return int(m.group(1)), "background_subtracted"
-    return None, None
-
-
 def build_ogawa_table(values_file, placement_file, output_folder, house_filter=None):
     if openpyxl is None:
         print("openpyxl is required for this -- install it with: pip install openpyxl")
         sys.exit(1)
 
     wb = openpyxl.load_workbook(values_file, data_only=True)
-    ws = wb["Sheet1"]
+    ws = wb["Ogawa_raw"]
     placement = _load_ogawa_placement_descriptions(placement_file)
 
+    header = [cell.value for cell in ws[1]]
     rows_out = []
-    current_house = None
     skipped = []
 
-    for row in ws.iter_rows(min_row=2, values_only=False):
-        row_map = {cell.coordinate[0]: cell.value for cell in row}
-        house_cell = row_map.get("A")
-        week_cell = row_map.get("B")
-        note = row_map.get("J", "") or ""
-
-        if isinstance(house_cell, (int, float)):
-            current_house = f"H{int(house_cell)}"
-
-        is_standalone_note = (
-            house_cell is None and week_cell is not None
-            and all(row_map.get(c) is None for c in OGAWA_COL_TO_LOCATION)
-        )
-        if is_standalone_note:
-            note_text = str(week_cell).strip()
-            m = re.search(r"week\s*(\d+)\s*house\s*(\d+)", note_text, re.IGNORECASE)
-            attached = False
-            if m:
-                target_week, target_house = int(m.group(1)), f"H{m.group(2)}"
-                for r in rows_out:
-                    if r["house_id"] == target_house and r["week"] == target_week:
-                        r["notes"] = (r["notes"] + "; " if r["notes"] else "") + note_text
-                        attached = True
-            if not attached:
-                skipped.append(dict(row_map))
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        record = dict(zip(header, row))
+        house_raw = record.get("HouseID")
+        phase_raw = record.get("Pre_Post")
+        if house_raw is None or phase_raw is None:
+            continue
+        house_id = f"H{int(house_raw)}"
+        phase = str(phase_raw).strip().lower()
+        if house_filter and house_id not in house_filter:
             continue
 
-        is_difference_row = any(
-            isinstance(cell_val, str) and "difference" in cell_val.lower()
-            for cell_val in (house_cell, week_cell)
-        )
-        if is_difference_row:
-            week, value_type = None, "difference"
-        else:
-            week, value_type = _classify_ogawa_week_cell(week_cell)
-
-        if value_type is None:
-            if house_cell or week_cell or note:
-                skipped.append(dict(row_map))
-            continue
-        if current_house is None:
-            skipped.append(dict(row_map))
-            continue
-        if house_filter and current_house not in house_filter:
-            continue
-
-        loc_descriptions = placement.get(current_house, {})
-        for col, loc_key in OGAWA_COL_TO_LOCATION.items():
-            val = row_map.get(col)
+        loc_descriptions = placement.get(house_id, {})
+        had_any_value = False
+        for col, loc_key in OGAWA_RAW_COL_TO_LOCATION.items():
+            val = record.get(col)
             if val is None or val == "":
                 continue
+            had_any_value = True
             rows_out.append({
-                "house_id": current_house,
-                "week": week if week is not None else "",
-                "value_type": value_type,
+                "house_id": house_id,
+                "phase": phase,
                 "location": loc_key,
                 "location_description": loc_descriptions.get(loc_key, ""),
                 "value_ppb": val,
-                "notes": note,
             })
-
-        if value_type == "raw":
-            for col, blank_name in (("H", "lab_blank"), ("I", "field_blank")):
-                val = row_map.get(col)
-                if val is None or val == "":
-                    continue
-                rows_out.append({
-                    "house_id": current_house,
-                    "week": week,
-                    "value_type": "raw",
-                    "location": blank_name,
-                    "location_description": "",
-                    "value_ppb": val,
-                    "notes": note,
-                })
+        if not had_any_value:
+            skipped.append((house_id, phase))
 
     out_path = os.path.join(output_folder, "ogawa.csv")
-    fieldnames = ["house_id", "week", "value_type", "location",
-                  "location_description", "value_ppb", "notes"]
+    fieldnames = ["house_id", "phase", "location", "location_description", "value_ppb"]
     with open(out_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -710,13 +650,8 @@ def build_ogawa_table(values_file, placement_file, output_folder, house_filter=N
     print(f"Wrote {len(rows_out)} rows to {out_path}")
     print(f"Houses found: {sorted(set(r['house_id'] for r in rows_out))}")
     if skipped:
-        print(f"{len(skipped)} row(s) skipped -- didn't match a known pattern:")
-        for s in skipped:
-            print(" ", s)
+        print(f"Skipped {len(skipped)} house/phase combo(s) with no results yet: {skipped}")
     return out_path
-
-
-
 # Driver
 
 
