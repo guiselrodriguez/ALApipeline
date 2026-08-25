@@ -4,9 +4,14 @@ process_hbrl_data.py's `sensors` command) and produces one figure with
 a stacked subplot for each variable you ask for.
 
 The underlying table stores timestamp_utc (true UTC). This script converts
-to PST 
+to PDT (local Oregon time) just for display -- the data itself stays in UTC,
+only the plot x-axis is shown in PDT.
 
-The x-axis is always time -- that's fixed by design, since the whole point
+When both pre and post are shown together (no --phase flag), each panel
+gets a shaded gap marking the excluded visit window, plus "pre"/"post"
+labels, so it's obvious at a glance where the intervention happened.
+
+The x-axis is always time -- that's always fixed, since the whole point
 of stacking panels is to visually line up spikes across different signals
 on the same timeline. Only the y-axis (which variables to show) is
 something you choose.
@@ -49,7 +54,7 @@ def usage_banner():
         '  python test_plot.py H1.csv --y "Atmocube:co2" "Geocene:stove_temp_left" "Anemometer:hood_airflow"',
         "",
         "Each --y entry is written as \"Instrument:variable\" (see the list below for valid options).",
-        "Every entry becomes its own stacked panel, sharing the same time axis (shown in PST).",
+        "Every entry becomes its own stacked panel, sharing the same time axis (shown in PDT).",
         "",
         "Optional flags:",
         "  --phase pre        only show the pre period",
@@ -75,28 +80,57 @@ def load_series(df, instrument, variable, phase=None):
     return sub["timestamp_pst_display"], sub["value"], unit
 
 
+def mark_pre_post_boundary(ax, df, show_labels=False):
+    """Draws a single thin dashed line marking where pre ends and post
+    begins, and (only on the bottom panel) labels 'pre'/'post' below the
+    x-axis. Only makes sense when both phases are present (no --phase
+    filter)."""
+    pre_rows = df[df["phase"] == "pre"]["timestamp_pst_display"]
+    post_rows = df[df["phase"] == "post"]["timestamp_pst_display"]
+    if pre_rows.empty or post_rows.empty:
+        return
+
+    pre_start, pre_end = pre_rows.min(), pre_rows.max()
+    post_start, post_end = post_rows.min(), post_rows.max()
+    gap_mid = pre_end + (post_start - pre_end) / 2
+
+    ax.axvline(gap_mid, color="gray", linestyle="--", linewidth=0.8, alpha=0.6, zorder=0)
+
+    if show_labels:
+        pre_center = pre_start + (pre_end - pre_start) / 2
+        post_center = post_start + (post_end - post_start) / 2
+        ax.text(pre_center, -0.15, "pre", transform=ax.get_xaxis_transform(),
+                ha="center", va="top", color="dimgray", fontsize=9, clip_on=False)
+        ax.text(post_center, -0.15, "post", transform=ax.get_xaxis_transform(),
+                ha="center", va="top", color="dimgray", fontsize=9, clip_on=False)
+
+
 def make_stack_plot(csv_file, y_series, phase=None, output="stack_plot.png"):
     df = pd.read_csv(csv_file, parse_dates=["timestamp_utc"])
-    # Fixed UTC-8, for display only -- the CSV itself stays in true UTC
-    df["timestamp_pst_display"] = df["timestamp_utc"] - timedelta(hours=8)
+    # PDT (local Oregon time), for display only -- the CSV itself stays in true UTC
+    df["timestamp_pst_display"] = df["timestamp_utc"] - timedelta(hours=7)
 
     fig, axes = plt.subplots(len(y_series), 1, figsize=(12, 3 * len(y_series)), sharex=True)
     if len(y_series) == 1:
         axes = [axes]
 
-    for ax, (instrument, variable) in zip(axes, y_series):
+    for i, (ax, (instrument, variable)) in enumerate(zip(axes, y_series)):
         x, y, unit = load_series(df, instrument, variable, phase)
         if x is None:
             print(f"Warning: no data found for {instrument}:{variable}" +
                   (f" (phase={phase})" if phase else "") + " -- leaving that panel blank")
             ax.set_title(f"{instrument}: {variable} -- NO DATA FOUND")
             continue
-        ax.plot(x, y, linewidth=0.8)
+        ax.plot(x, y, linewidth=0.8, zorder=2)
         ax.set_ylabel(f"{variable}\n({unit})" if unit else variable)
         ax.set_title(f"{instrument}: {variable}")
         ax.grid(alpha=0.3)
 
-    axes[-1].set_xlabel("Time (PST)")
+        if not phase:
+            series_mask = (df["instrument"] == instrument) & (df["variable"] == variable)
+            mark_pre_post_boundary(ax, df[series_mask], show_labels=(i == len(axes) - 1))
+
+    axes[-1].set_xlabel("Time (PDT)")
     if phase:
         fig.suptitle(f"Phase: {phase}", fontsize=13, fontweight="bold")
     plt.tight_layout()
