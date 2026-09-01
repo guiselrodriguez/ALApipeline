@@ -40,17 +40,32 @@ pre/post on its own. That's always figured out per row using House_charac's
 Visit dates, no matter what the filename says. Inputs can be zip files or
 already-extracted folders, either works.
 
+Some folders get skipped entirely no matter what's in them: anything with
+"processed", "metrics", or "mission_logs" in the path. These have turned out
+to hold someone's own already-processed output (can have the exact same
+filename as the real raw file) or raw device export dumps whose files can
+coincidentally match our naming pattern.
+
 Timezone handling:
- - Atmocube, Geocene, Hobo, and AirAssure all label their own timezone in
-   the raw file, so those just get converted straight to UTC .
- - Kestrel, Aranet, and Anemometer are local Oregon time (PDT, UTC-7), so that's the offset used
-   to convert them to UTC.
- - House_charac's Visit dates use the same PDT conversion
+ - Atmocube, Hobo, and AirAssure all label their own timezone in the raw
+   file, so those just get converted straight to UTC.
+ - Geocene's raw timestamps normally end in 'Z' (UTC) -- when that's there,
+   it converts directly. If not, it's treated as local Oregon time (PDT)
+   and converted. This is checked per file rather than assumed.
+ - Kestrel, Aranet, and Anemometer are local Oregon time (PDT, UTC-7), so
+   that's the offset used to convert them to UTC.
+ - House_charac's Visit dates use the same PDT conversion.
+
+Some AirAssure/Geocene files are missing entirely for a house/period and
+only exist as the device's own raw export zip, not the clean file this
+pipeline normally reads. For Geocene there's a fallback that reads that
+zip directly when the clean file isn't found.
 """
 
 import argparse
 import csv
 import glob
+import gzip
 import json
 import os
 import re
@@ -66,7 +81,7 @@ try:
 except ImportError:
     openpyxl = None  # only needed for house-charac, ogawa, and --sensor-ids
 
-PDT = timezone(timedelta(hours=-7))  # Local
+PDT = timezone(timedelta(hours=-7))  # Local Oregon time
 
 
 def fmt_time(dt):
@@ -79,6 +94,10 @@ def fmt_time(dt):
 FNAME_RE_NEW = re.compile(r'^h(\d+)_(pre|post)_(.+)\.([^.]+)$', re.IGNORECASE)
 FNAME_RE_OLD = re.compile(r'^h(\d+)_w(\d+)_(.+)\.([^.]+)$', re.IGNORECASE)
 FNAME_RE_LEGACY = re.compile(r'^house(\d+)_week(\d+)_(.+)\.([^.]+)$', re.IGNORECASE)
+
+# skip anything in these folders -- someone's own processed output, or raw
+# device export dumps whose files can coincidentally match our naming pattern
+EXCLUDED_PATH_KEYWORDS = ["processed", "metrics"]
 
 
 def match_filename(base):
@@ -113,10 +132,9 @@ def _is_genuine_raw_airassure(path):
 
 
 def _airassure_date_range(path):
-    """Peeks first/last raw timestamp in an AirAssure file (skipping
-    comments/header) -- used only to detect whether a 'combined' file's
-    time range overlaps with individual part files (duplicate, drop it)
-    or covers a period the parts don't have at all (keep it)."""
+    """Peeks first/last raw timestamp in an AirAssure file -- used to tell
+    if a 'combined' file overlaps with the individual parts (duplicate,
+    drop it) or covers a period the parts don't have (keep it)."""
     header = None
     first_dt, last_dt = None, None
     with open(path, newline="") as f:
@@ -133,9 +151,8 @@ def _airassure_date_range(path):
             raw_ts = rec.get("Timestamp")
             if not raw_ts:
                 continue
-            try:
-                dt = datetime.strptime(raw_ts, "%m/%d/%Y %H:%M")
-            except ValueError:
+            dt = _parse_airassure_timestamp(raw_ts)
+            if dt is None:
                 continue
             if first_dt is None:
                 first_dt = dt
@@ -151,11 +168,29 @@ def discover_groups(folder):
     groups = defaultdict(dict)
     airassure_parts_by_house = defaultdict(list)
     airassure_combined_by_house = defaultdict(list)
+    geocene_raw_sources = defaultdict(list)  # raw exports (zip OR already-extracted folder), tracked as a fallback
 
     for path in sorted(glob.glob(os.path.join(folder, "**", "*"), recursive=True)):
         if os.path.isdir(path):
             continue
+        path_lower = path.lower()
+        if any(kw in path_lower for kw in EXCLUDED_PATH_KEYWORDS):
+            continue
+
         base = os.path.basename(path)
+
+        # A raw Geocene export shows up either as a .zip, or already
+        # unzipped with missions.csv sitting loose in the folder -- catch
+        # both, since Drive doesn't always keep it zipped.
+        if "geocene" in path_lower and (base.lower().endswith(".zip") or base.lower() == "missions.csv"):
+            m_house = re.search(r"[Hh](\d+)\s*(PRE|POST)", path)
+            if m_house:
+                key = (m_house.group(1), m_house.group(2).lower())
+                source = path if base.lower().endswith(".zip") else os.path.dirname(path)
+                if source not in geocene_raw_sources[key]:
+                    geocene_raw_sources[key].append(source)
+            continue
+
         m = match_filename(base)
         if not m:
             continue
@@ -206,6 +241,12 @@ def discover_groups(folder):
                 print(f"AirAssure: {path} overlaps with individual part files -- skipped as a duplicate")
                 continue
             groups[key].setdefault("airassure", []).append(path)
+
+    # if no clean geocene_left/right.json was found for a group, fall back to the raw export
+    for key, sources in geocene_raw_sources.items():
+        if "geocene_left" not in groups[key] and "geocene_right" not in groups[key]:
+            groups[key]["geocene_raw_sources"] = sources
+
     return groups
 
 
@@ -225,6 +266,61 @@ def cleanup_temp_dirs(temp_dirs):
         shutil.rmtree(d, ignore_errors=True)
 
 
+# Reads the raw Geocene export directly, used when the clean flattened json isn't there
+
+
+def _read_geocene_raw_folder(folder):
+    """missions.csv + metrics/*.json.gz. Side (left/right) comes from
+    missions.csv's notes field."""
+    side = None
+    missions_path = os.path.join(folder, "missions.csv")
+    if os.path.exists(missions_path):
+        with open(missions_path, newline="") as f:
+            for row in csv.DictReader(f):
+                notes = (row.get("notes") or "").lower()
+                if "left" in notes:
+                    side = "left"
+                elif "right" in notes:
+                    side = "right"
+                break
+
+    metrics_dir = os.path.join(folder, "metrics")
+    rows = []
+    if os.path.isdir(metrics_dir):
+        for fname in os.listdir(metrics_dir):
+            mpath = os.path.join(metrics_dir, fname)
+            with gzip.open(mpath) as f:
+                data = json.load(f)
+            for entry in data:
+                if entry.get("sensor_type_id") != 1:  # 1 = k-type thermocouple, Celsius
+                    continue
+                raw_ts = entry.get("timestamp", "")
+                val = entry.get("value")
+                if val is None:
+                    continue
+                try:
+                    dt_utc = datetime.strptime(raw_ts[:19], "%Y-%m-%dT%H:%M:%S")
+                except ValueError:
+                    continue
+                var = f"stove_temp_{side}" if side else "stove_temp_unknown"
+                rows.append((dt_utc, var, val, "C", "ok"))
+    return side, rows
+
+
+def parse_geocene_raw_export(source_path):
+    """source_path can be a .zip file OR an already-extracted folder --
+    Drive doesn't always keep these zipped, so both need to work."""
+    if os.path.isdir(source_path):
+        return _read_geocene_raw_folder(source_path)
+    temp_dir = tempfile.mkdtemp(prefix="geocene_raw_")
+    try:
+        with zipfile.ZipFile(source_path) as zf:
+            zf.extractall(temp_dir)
+        return _read_geocene_raw_folder(temp_dir)
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
 # Anemometer parsing (hood_airflow readings) + gap detection, shared helpers
 
 
@@ -232,10 +328,20 @@ def parse_anemometer_rows(path):
     rows = []
     with open(path, encoding="utf-8", errors="replace") as f:
         for line in f:
-            parts = [p.strip() for p in line.strip().split(",")]
-            if len(parts) < 5:
+            raw = line.strip()
+            if not raw:
                 continue
-            date_s, time_s = parts[-2], parts[-1]
+            sep = "\t" if "\t" in raw else ","  # some exports use tabs instead of commas
+            parts = [p.strip() for p in raw.split(sep)]
+            if len(parts) < 4:
+                continue
+            date_time_field = parts[-1]
+            if "," in date_time_field:
+                date_s, time_s = [p.strip() for p in date_time_field.split(",", 1)]
+            elif len(parts) >= 5:
+                date_s, time_s = parts[-2], parts[-1]
+            else:
+                continue
             if not re.match(r"^\d{2}-\d{2}-\d{4}$", date_s):
                 continue
             try:
@@ -243,7 +349,7 @@ def parse_anemometer_rows(path):
                 value = float(parts[1])
             except ValueError:
                 continue
-             # No timezone in the file itself -- this is local Oregon time (PDT), so it gets converted to UTC
+            # No timezone in the file itself -- this is local Oregon time (PDT), so it gets converted to UTC
             dt = dt_local.replace(tzinfo=PDT).astimezone(timezone.utc).replace(tzinfo=None)
             rows.append((dt, value))
     return rows
@@ -259,11 +365,11 @@ def detect_gaps(label, house_num, week_num, timestamps, min_gap_minutes=15):
     for a, b in zip(ts_sorted, ts_sorted[1:]):
         gap = (b - a).total_seconds()
         if gap > threshold:
-            a_pst, b_pst = a - timedelta(hours=7), b - timedelta(hours=7)
-            date_str = a_pst.strftime("%m/%d") if a_pst.date() == b_pst.date() else f"{a_pst.strftime('%m/%d')}-{b_pst.strftime('%m/%d')}"
+            a_pdt, b_pdt = a - timedelta(hours=7), b - timedelta(hours=7)
+            date_str = a_pdt.strftime("%m/%d") if a_pdt.date() == b_pdt.date() else f"{a_pdt.strftime('%m/%d')}-{b_pdt.strftime('%m/%d')}"
             print(
                 f"House {house_num} Week {week_num} {label}: no data on {date_str} "
-                f"between {fmt_time(a_pst)} and {fmt_time(b_pst)} PDT"
+                f"between {fmt_time(a_pdt)} and {fmt_time(b_pdt)} PDT"
             )
 
 
@@ -311,7 +417,8 @@ def parse_atmocube(path):
 
 
 def parse_geocene(path, side):
-    """Raw timestamps end in 'Z' (ISO 8601 UTC) -- already true UTC."""
+    """If the raw timestamp ends in 'Z', it's already UTC -- no conversion.
+    If not, treat it as local Oregon time (PDT) and convert."""
     rows = []
     var = f"stove_temp_{side}"
     with open(path) as f:
@@ -321,8 +428,13 @@ def parse_geocene(path, side):
         val = entry.get("value")
         if val is None:
             continue
+        is_utc = raw_ts.strip().upper().endswith("Z")
         try:
-            dt_utc = datetime.strptime(raw_ts[:19], "%Y-%m-%dT%H:%M:%S")
+            if is_utc:
+                dt_utc = datetime.strptime(raw_ts[:19], "%Y-%m-%dT%H:%M:%S")
+            else:
+                dt_local = datetime.strptime(raw_ts[:19], "%Y-%m-%dT%H:%M:%S")
+                dt_utc = dt_local.replace(tzinfo=PDT).astimezone(timezone.utc).replace(tzinfo=None)
         except ValueError:
             continue
         rows.append((dt_utc, var, val, "C", "ok"))
@@ -470,6 +582,7 @@ def _normalize_col(name):
     name = re.sub(r"\([^)]*\)", "", name)
     return re.sub(r"[^a-z0-9]", "", name.lower())
 
+
 # each entry maps a column name from the file -> what we call it, which error codes apply, and where to find its status column
 AIRASSURE_VAR_MAP = {
     "temperature": ("temperature", GENERAL_SENSOR_CODES, ["temperaturestatus", "temperaturerelativehumiditystatus", "relativehumiditystatus"]),
@@ -508,8 +621,18 @@ def decode_bits(value, code_map):
     return meanings
 
 
+def _parse_airassure_timestamp(raw_ts):
+    """Different deliveries use different timestamp formats for this column."""
+    for fmt in ("%m/%d/%Y %H:%M", "%Y-%m-%d %H:%M:%S", "%m/%d/%Y %H:%M:%S"):
+        try:
+            return datetime.strptime(raw_ts, fmt)
+        except ValueError:
+            continue
+    return None
+
+
 def parse_airassure(paths, house_num, week_num):
-    """Labeled 'UTC"""
+    """File's units row literally says UTC, so no conversion needed."""
     header = None
     units_row = None
     data_lines = []
@@ -533,7 +656,6 @@ def parse_airassure(paths, house_num, week_num):
         print(f"House {house_num} Week {week_num} AirAssure: no recognizable header found, skipping")
         return []
 
-   #Match up expected columns to this file's actual column names -- different files have named the same columns differently
     normalized_header = {_normalize_col(h): h for h in header}
     resolved = {}  # actual_col_name -> (our_var_name, code_map, actual_status_col_name_or_None, unit)
     unresolved = []
@@ -558,9 +680,8 @@ def parse_airassure(paths, house_num, week_num):
         raw_ts = rec.get("Timestamp")
         if not raw_ts:
             continue
-        try:
-            dt_utc = datetime.strptime(raw_ts, "%m/%d/%Y %H:%M")
-        except ValueError:
+        dt_utc = _parse_airassure_timestamp(raw_ts)
+        if dt_utc is None:
             continue
         if dt_utc in seen_ts:
             continue
@@ -593,10 +714,10 @@ def parse_airassure(paths, house_num, week_num):
 
     for dt_utc in sorted(ts_errors):
         reasons = "; ".join(ts_errors[dt_utc])
-        dt_pst_display = dt_utc - timedelta(hours=7)
+        dt_pdt_display = dt_utc - timedelta(hours=7)
         print(
-            f"House {house_num} Week {week_num} AirAssure at {fmt_time(dt_pst_display)} on "
-            f"{dt_pst_display.strftime('%Y-%m-%d')} PDT had an error: {reasons}"
+            f"House {house_num} Week {week_num} AirAssure at {fmt_time(dt_pdt_display)} on "
+            f"{dt_pdt_display.strftime('%Y-%m-%d')} PDT had an error: {reasons}"
         )
 
     detect_gaps("AirAssure", house_num, week_num, all_ts)
@@ -746,7 +867,6 @@ def build_ogawa_table(values_file, placement_file, output_folder, house_filter=N
     return out_path
 
 
-
 # Sensor IDs (static per-house metadata, added as a column on the sensors table)
 
 
@@ -758,9 +878,8 @@ GEOCENE_SENSOR_ID_COLUMN_MAP = {"stove_temp_left": "Geocene Left", "stove_temp_r
 
 
 def load_sensor_ids(path):
-    """house_id -> {instrument_or_variable: sensor_id}. Geocene is keyed by
-    variable (stove_temp_left/right), not instrument, since both burners
-    share the instrument name "Geocene" but need different sensor IDs."""
+    """Geocene is keyed by variable (stove_temp_left/right), not
+    instrument, since both burners need different sensor IDs."""
     wb = openpyxl.load_workbook(path, data_only=True)
     ws = wb["Sheet1"]
     header = [c.value for c in next(ws.iter_rows(min_row=1, max_row=1))]
@@ -777,12 +896,11 @@ def load_sensor_ids(path):
     return sensor_ids
 
 
-
 # Visit dates / phase windows
 
 
 def load_visit_dates(house_charac_file):
-    # returns each house's visit dates (visit 1, 2, 3), converted to UTC.
+    """Returns house_id -> [visit1_dt, visit2_dt, visit3_dt or None], all in true UTC."""
     wb = openpyxl.load_workbook(house_charac_file, data_only=True)
     ws = wb["Sheet1"]
     header_row = [cell.value for cell in ws[2]]
@@ -860,6 +978,11 @@ def process_house(house_num, week_groups, house_charac_file, output_folder, sens
             add("Geocene", parse_geocene(files["geocene_left"], "left"))
         if "geocene_right" in files:
             add("Geocene", parse_geocene(files["geocene_right"], "right"))
+        if "geocene_raw_sources" in files:
+            for source in files["geocene_raw_sources"]:
+                side, rows = parse_geocene_raw_export(source)
+                print(f"House {house_num} group {week_num}: recovered {len(rows)} Geocene rows ({side or 'unknown side'}) from raw export {source}")
+                add("Geocene", rows)
         if "hobo" in files:
             add("Hobo", parse_hobo(files["hobo"]))
         if "anemometer" in files:
@@ -911,13 +1034,12 @@ def process_house(house_num, week_groups, house_charac_file, output_folder, sens
     return out_path
 
 
-
-# verify-timezones
+# verify-timezones: audits the ACTUAL production parser functions above
 
 
 TZ_SOURCE_NOTES = {
     "Atmocube": ("Unix epoch, already UTC", "datetime.fromtimestamp(epoch, tz=UTC)"),
-    "Geocene": ("Timestamp ends in 'Z' = UTC", "Parsed directly, no conversion"),
+    "Geocene": ("Ends in 'Z' = UTC; otherwise treated as local PDT", "Parsed directly if 'Z', else convert (+7h)"),
     "AirAssure": ("File says UTC in the units row", "Parsed directly, no conversion"),
     "Hobo": ("File header gives the offset (e.g. GMT-07:00)", "Convert using that offset"),
     "Kestrel": ("Local Oregon time, PDT (UTC-7)", "Convert to UTC (+7h)"),
@@ -983,10 +1105,23 @@ def _peek_raw_timestamp(kind, path, n):
         elif kind == "anemometer":
             with open(path, encoding="utf-8", errors="replace") as f:
                 for line in f:
-                    parts = [p.strip() for p in line.strip().split(",")]
-                    if len(parts) < 5 or not re.match(r"^\d{2}-\d{2}-\d{4}$", parts[-2]):
+                    raw = line.strip()
+                    if not raw:
                         continue
-                    raw_values.append(f"{parts[-2]} {parts[-1]}")
+                    sep = "\t" if "\t" in raw else ","
+                    parts = [p.strip() for p in raw.split(sep)]
+                    if len(parts) < 4:
+                        continue
+                    date_time_field = parts[-1]
+                    if "," in date_time_field:
+                        date_s, time_s = [p.strip() for p in date_time_field.split(",", 1)]
+                    elif len(parts) >= 5:
+                        date_s, time_s = parts[-2], parts[-1]
+                    else:
+                        continue
+                    if not re.match(r"^\d{2}-\d{2}-\d{4}$", date_s):
+                        continue
+                    raw_values.append(f"{date_s} {time_s}")
                     if len(raw_values) >= n:
                         break
         elif kind == "hobo":

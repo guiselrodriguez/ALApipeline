@@ -8,7 +8,7 @@ to PDT (local Oregon time) just for display -- the data itself stays in UTC,
 only the plot x-axis is shown in PDT.
 
 When both pre and post are shown together (no --phase flag), each panel
-gets a shaded gap marking the excluded visit window, plus "pre"/"post"
+gets a vertical line marking the excluded visit window, plus "pre"/"post"
 labels, so it's obvious at a glance where the intervention happened.
 
 The x-axis is always time -- that's always fixed, since the whole point
@@ -81,10 +81,9 @@ def load_series(df, instrument, variable, phase=None):
 
 
 def mark_pre_post_boundary(ax, df, show_labels=False):
-    """Draws a single thin dashed line marking where pre ends and post
-    begins, and (only on the bottom panel) labels 'pre'/'post' below the
-    x-axis. Only makes sense when both phases are present (no --phase
-    filter)."""
+    """Draws a red dashed line marking where pre ends and post begins,
+    and (only on the bottom panel) labels 'pre'/'post' below the x-axis.
+    Only makes sense when both phases are present (no --phase filter)."""
     pre_rows = df[df["phase"] == "pre"]["timestamp_pst_display"]
     post_rows = df[df["phase"] == "post"]["timestamp_pst_display"]
     if pre_rows.empty or post_rows.empty:
@@ -94,7 +93,7 @@ def mark_pre_post_boundary(ax, df, show_labels=False):
     post_start, post_end = post_rows.min(), post_rows.max()
     gap_mid = pre_end + (post_start - pre_end) / 2
 
-    ax.axvline(gap_mid, color="gray", linestyle="--", linewidth=0.8, alpha=0.6, zorder=0)
+    ax.axvline(gap_mid, color="red", linestyle="--", linewidth=1.5, alpha=0.8, zorder=0)
 
     if show_labels:
         pre_center = pre_start + (pre_end - pre_start) / 2
