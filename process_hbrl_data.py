@@ -94,10 +94,13 @@ def fmt_time(dt):
 FNAME_RE_NEW = re.compile(r'^h(\d+)_(pre|post)_(.+)\.([^.]+)$', re.IGNORECASE)
 FNAME_RE_OLD = re.compile(r'^h(\d+)_w(\d+)_(.+)\.([^.]+)$', re.IGNORECASE)
 FNAME_RE_LEGACY = re.compile(r'^house(\d+)_week(\d+)_(.+)\.([^.]+)$', re.IGNORECASE)
+FNAME_RE_SHORT_WEEK = re.compile(r'^h(\d+)_week(\d+)_(.+)\.([^.]+)$', re.IGNORECASE)
+FNAME_RE_BARE = re.compile(r'^h(\d+)_(.+)\.([^.]+)$', re.IGNORECASE)
+
 
 # skip anything in these folders -- someone's own processed output, or raw
 # device export dumps whose files can coincidentally match our naming pattern
-EXCLUDED_PATH_KEYWORDS = ["processed", "metrics"]
+EXCLUDED_PATH_KEYWORDS = ["processed", "metrics", "mission_logs"]
 
 
 def match_filename(base):
@@ -111,6 +114,10 @@ def match_filename(base):
         house_num, week_num, rest, ext = m.groups()
         return house_num, f"w{week_num}", rest, ext
     m = FNAME_RE_LEGACY.match(base)
+    if m:
+        house_num, week_num, rest, ext = m.groups()
+        return house_num, f"w{week_num}", rest, ext
+    m = FNAME_RE_SHORT_WEEK.match(base)
     if m:
         house_num, week_num, rest, ext = m.groups()
         return house_num, f"w{week_num}", rest, ext
@@ -170,6 +177,9 @@ def discover_groups(folder):
     airassure_combined_by_house = defaultdict(list)
     geocene_raw_sources = defaultdict(list)  # raw exports (zip OR already-extracted folder), tracked as a fallback
 
+    TEXT_ONLY_EXTENSIONS = {"csv", "txt", "log", "xls"}
+    BLOCKED_EXTENSIONS = {"png", "jpg", "jpeg", "gif", "pdf", "mp4", "mov", "bmp"}
+
     for path in sorted(glob.glob(os.path.join(folder, "**", "*"), recursive=True)):
         if os.path.isdir(path):
             continue
@@ -187,17 +197,45 @@ def discover_groups(folder):
             if m_house:
                 key = (m_house.group(1), m_house.group(2).lower())
                 source = path if base.lower().endswith(".zip") else os.path.dirname(path)
-                if source not in geocene_raw_sources[key]:
-                    geocene_raw_sources[key].append(source)
+                # Guess side from the source's own name when possible (e.g.
+                # "h7_pre_geocene_right/"), so a clean file for ONE side
+                # doesn't cause us to wrongly skip a needed fallback for
+                # the OTHER side (a house had this exact situation: clean
+                # left.json present, right only available as a raw export).
+                source_base_lower = os.path.basename(source.rstrip("/\\")).lower()
+                if "left" in source_base_lower:
+                    guessed_side = "left"
+                elif "right" in source_base_lower:
+                    guessed_side = "right"
+                else:
+                    guessed_side = None
+                entry = (guessed_side, source)
+                if entry not in geocene_raw_sources[key]:
+                    geocene_raw_sources[key].append(entry)
             continue
 
         m = match_filename(base)
+        if not m:
+            # Last resort: house prefix directly followed by the instrument
+            # name, no pre/post/week segment at all (e.g.
+            # "h7_kestrel_outdoor_rh_temp.csv" sitting in an "H7 POST"
+            # folder). Only used when we can independently confirm the
+            # phase from the folder path -- never guessed blindly.
+            m_bare = FNAME_RE_BARE.match(base)
+            if m_bare:
+                m_phase = re.search(r"[Hh]\d+\s*(PRE|POST)", path, re.IGNORECASE)
+                if m_phase:
+                    house_num_bare, rest_bare, ext_bare = m_bare.groups()
+                    m = (house_num_bare, m_phase.group(1).lower(), rest_bare, ext_bare)
         if not m:
             continue
         house_num, group_label, rest, ext = m
         key = (house_num, group_label)
         rest_l = rest.lower()
         ext_l = ext.lower()
+
+        if ext_l in BLOCKED_EXTENSIONS:
+            continue
 
         if rest_l.startswith("airassure"):
             if not _is_genuine_raw_airassure(path):
@@ -214,15 +252,20 @@ def discover_groups(folder):
             if ext_l == "json" or "geocene_right" not in groups[key]:
                 groups[key]["geocene_right"] = path
         elif rest_l.startswith("atmocube"):
-            groups[key]["atmocube"] = path
+            if ext_l in TEXT_ONLY_EXTENSIONS:
+                groups[key]["atmocube"] = path
         elif rest_l.startswith("kestrel"):
-            groups[key]["kestrel"] = path
+            if ext_l in TEXT_ONLY_EXTENSIONS:
+                groups[key]["kestrel"] = path
         elif rest_l.startswith("aranet"):
-            groups[key]["aranet"] = path
+            if ext_l in TEXT_ONLY_EXTENSIONS:
+                groups[key]["aranet"] = path
         elif rest_l.startswith("anemometer"):
-            groups[key]["anemometer"] = path
+            if ext_l in TEXT_ONLY_EXTENSIONS:
+                groups[key]["anemometer"] = path
         elif rest_l.startswith("hobo"):
-            groups[key]["hobo"] = path
+            if ext_l in TEXT_ONLY_EXTENSIONS:
+                groups[key]["hobo"] = path
         elif rest_l.startswith("ogawa"):
             groups[key]["ogawa"] = path
         elif rest_l.startswith("house_charac") or rest_l.startswith("housecharac"):
@@ -244,8 +287,17 @@ def discover_groups(folder):
 
     # if no clean geocene_left/right.json was found for a group, fall back to the raw export
     for key, sources in geocene_raw_sources.items():
-        if "geocene_left" not in groups[key] and "geocene_right" not in groups[key]:
-            groups[key]["geocene_raw_sources"] = sources
+        needed = []
+        for guessed_side, source in sources:
+            if guessed_side == "left" and "geocene_left" in groups[key]:
+                continue  # already have a clean file for this specific side
+            if guessed_side == "right" and "geocene_right" in groups[key]:
+                continue
+            if guessed_side is None and ("geocene_left" in groups[key] or "geocene_right" in groups[key]):
+                continue  # can't tell which side this is -- assume it's redundant if either side is already covered
+            needed.append(source)
+        if needed:
+            groups[key]["geocene_raw_sources"] = needed
 
     return groups
 
@@ -269,30 +321,45 @@ def cleanup_temp_dirs(temp_dirs):
 # Reads the raw Geocene export directly, used when the clean flattened json isn't there
 
 
-def _read_geocene_raw_folder(folder):
-    """missions.csv + metrics/*.json.gz. Side (left/right) comes from
-    missions.csv's notes field."""
+def _read_geocene_raw_folder(folder, source_name_hint=None):
     side = None
-    missions_path = os.path.join(folder, "missions.csv")
-    if os.path.exists(missions_path):
-        with open(missions_path, newline="") as f:
-            for row in csv.DictReader(f):
-                notes = (row.get("notes") or "").lower()
-                if "left" in notes:
-                    side = "left"
-                elif "right" in notes:
-                    side = "right"
-                break
+    # The source zip/folder's own name sometimes says the side directly
+    # (e.g. "h6_post_geocene_left.zip") -- missions.csv's notes field has
+    # been found completely blank for some houses, so check the filename
+    # first rather than relying on notes alone.
+    if source_name_hint:
+        hint_lower = source_name_hint.lower()
+        if "left" in hint_lower:
+            side = "left"
+        elif "right" in hint_lower:
+            side = "right"
+
+    if side is None:
+        missions_path = os.path.join(folder, "missions.csv")
+        if os.path.exists(missions_path):
+            with open(missions_path, newline="") as f:
+                for row in csv.DictReader(f):
+                    notes = (row.get("notes") or "").lower()
+                    if "left" in notes:
+                        side = "left"
+                    elif "right" in notes:
+                        side = "right"
+                    break
 
     metrics_dir = os.path.join(folder, "metrics")
     rows = []
     if os.path.isdir(metrics_dir):
         for fname in os.listdir(metrics_dir):
             mpath = os.path.join(metrics_dir, fname)
-            with gzip.open(mpath) as f:
-                data = json.load(f)
+            if os.path.isdir(mpath):
+                continue
+            try:
+                with gzip.open(mpath) as f:
+                    data = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                continue
             for entry in data:
-                if entry.get("sensor_type_id") != 1:  # 1 = k-type thermocouple, Celsius
+                if entry.get("sensor_type_id") != 1:
                     continue
                 raw_ts = entry.get("timestamp", "")
                 val = entry.get("value")
@@ -306,17 +373,17 @@ def _read_geocene_raw_folder(folder):
                 rows.append((dt_utc, var, val, "C", "ok"))
     return side, rows
 
+    
 
 def parse_geocene_raw_export(source_path):
-    """source_path can be a .zip file OR an already-extracted folder --
-    Drive doesn't always keep these zipped, so both need to work."""
+    name_hint = os.path.basename(source_path.rstrip("/\\"))
     if os.path.isdir(source_path):
-        return _read_geocene_raw_folder(source_path)
+        return _read_geocene_raw_folder(source_path, name_hint)
     temp_dir = tempfile.mkdtemp(prefix="geocene_raw_")
     try:
         with zipfile.ZipFile(source_path) as zf:
             zf.extractall(temp_dir)
-        return _read_geocene_raw_folder(temp_dir)
+        return _read_geocene_raw_folder(temp_dir, name_hint)
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -396,7 +463,8 @@ ATMOCUBE_MAP = {
 
 
 def parse_atmocube(path):
-    """Uses the 'ts' unix epoch column."""
+    """Uses the 'ts' unix epoch column (inherently UTC) rather than the
+    file's own 'Timestamp PST' column, which was found to be mislabeled."""
     rows = []
     with open(path, newline="") as f:
         for r in csv.DictReader(f):
@@ -407,7 +475,16 @@ def parse_atmocube(path):
                 epoch = int(ts)
             except ValueError:
                 continue
+            if epoch < 1700000000:  # sanity check -- rejects garbage/corrupted epoch values (seen: a single ts~0 row)
+                continue
             dt_utc = datetime.fromtimestamp(epoch, tz=timezone.utc).replace(tzinfo=None)
+            hum = r.get("h")
+            if hum not in (None, ""):
+                try:
+                    if not (0 <= float(hum) <= 100):
+                        continue  # corrupted/truncated row -- humidity can't physically exceed 100%
+                except ValueError:
+                    pass
             for col, (var, unit) in ATMOCUBE_MAP.items():
                 val = r.get(col)
                 if val in (None, ""):
@@ -531,7 +608,7 @@ def parse_kestrel(path):
 def parse_aranet(path):
     """No timezone in the file itself -- this is local Oregon time (PDT), so it gets converted to UTC."""
     rows = []
-    with open(path, newline="") as f:
+    with open(path, newline="", encoding="utf-8-sig") as f:
         for r in csv.DictReader(f):
             raw_ts = list(r.values())[0]
             try:
@@ -906,17 +983,22 @@ def load_visit_dates(house_charac_file):
     header_row = [cell.value for cell in ws[2]]
     idx = {name: i for i, name in enumerate(header_row) if name in ("House", "Visit 1", "Visit 2", "Visit 3")}
 
-    def to_utc(v):
-        return v.replace(tzinfo=PDT).astimezone(timezone.utc).replace(tzinfo=None) if v else None
+    def to_utc(v, house_id, label):
+        if v is None:
+            return None
+        if not isinstance(v, datetime):
+            print(f"House {house_id}: {label} isn't a real date in the spreadsheet (got {v!r} instead) -- treating it as missing")
+            return None
+        return v.replace(tzinfo=PDT).astimezone(timezone.utc).replace(tzinfo=None)
 
     visits = {}
     for row in ws.iter_rows(min_row=3, values_only=True):
         house_id = row[idx["House"]] if "House" in idx else None
         if not house_id:
             continue
-        v1 = to_utc(row[idx["Visit 1"]] if "Visit 1" in idx else None)
-        v2 = to_utc(row[idx["Visit 2"]] if "Visit 2" in idx else None)
-        v3 = to_utc(row[idx["Visit 3"]] if "Visit 3" in idx else None)
+        v1 = to_utc(row[idx["Visit 1"]] if "Visit 1" in idx else None, house_id, "Visit 1")
+        v2 = to_utc(row[idx["Visit 2"]] if "Visit 2" in idx else None, house_id, "Visit 2")
+        v3 = to_utc(row[idx["Visit 3"]] if "Visit 3" in idx else None, house_id, "Visit 3")
         visits[str(house_id).strip()] = (v1, v2, v3)
     return visits
 
