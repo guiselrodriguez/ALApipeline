@@ -193,7 +193,7 @@ def discover_groups(folder):
         # unzipped with missions.csv sitting loose in the folder -- catch
         # both, since Drive doesn't always keep it zipped.
         if "geocene" in path_lower and (base.lower().endswith(".zip") or base.lower() == "missions.csv"):
-            m_house = re.search(r"[Hh](\d+)\s*(PRE|POST)", path)
+            m_house = re.search(r"h(\d+)[\s_]*(PRE|POST)", path, re.IGNORECASE)
             if m_house:
                 key = (m_house.group(1), m_house.group(2).lower())
                 source = path if base.lower().endswith(".zip") else os.path.dirname(path)
@@ -485,6 +485,13 @@ def parse_atmocube(path):
                         continue  # corrupted/truncated row -- humidity can't physically exceed 100%
                 except ValueError:
                     pass
+            temp = r.get("t")
+            if temp not in (None, ""):
+                try:
+                    if not (-40 <= float(temp) <= 85):
+                        continue  # corrupted row -- outside the sensor's physical range (seen: 295 C with humidity 1% and co2 68 ppm)
+                except ValueError:
+                    pass
             for col, (var, unit) in ATMOCUBE_MAP.items():
                 val = r.get(col)
                 if val in (None, ""):
@@ -605,15 +612,26 @@ def parse_kestrel(path):
     return rows
 
 
+ARANET_TIMESTAMP_FORMATS = ("%d/%m/%Y %I:%M:%S %p", "%d/%m/%y %I:%M %p", "%d/%m/%y %I:%M:%S %p", "%d/%m/%Y %I:%M %p")
+
+
 def parse_aranet(path):
     """No timezone in the file itself -- this is local Oregon time (PDT), so it gets converted to UTC."""
     rows = []
     with open(path, newline="", encoding="utf-8-sig") as f:
         for r in csv.DictReader(f):
             raw_ts = list(r.values())[0]
-            try:
-                dt_local = datetime.strptime(raw_ts.strip(), "%d/%m/%Y %I:%M:%S %p")
-            except (ValueError, AttributeError):
+            dt_local = None
+            # Some Aranet exports switch timestamp format partway through the
+            # file (house 8 went from 18/09/2026 8:37:06 AM to 8/10/26 1:37 PM),
+            # so try each known format. All are day-first.
+            for timestamp_format in ARANET_TIMESTAMP_FORMATS:
+                try:
+                    dt_local = datetime.strptime(raw_ts.strip(), timestamp_format)
+                    break
+                except (ValueError, AttributeError):
+                    continue
+            if dt_local is None:
                 continue
             dt = dt_local.replace(tzinfo=PDT).astimezone(timezone.utc).replace(tzinfo=None)
             co2 = r.get("Carbon dioxide(ppm)")
@@ -823,13 +841,57 @@ HOUSE_CHARAC_COLUMN_MAP = {
 }
 
 
+def find_house_charac_header_row(worksheet):
+    """The House_charac header has been on row 1 in some versions of the file
+    and row 2 in others, so look for the row whose first cell is 'House'
+    instead of assuming a fixed row number."""
+    for row_number in range(1, 6):
+        first_cell = worksheet.cell(row=row_number, column=1).value
+        if first_cell is not None and str(first_cell).strip() == "House":
+            return row_number
+    raise ValueError("Couldn't find the header row (a row starting with 'House') in the first 5 rows of House_charac")
+
+
+TEXT_VISIT_DATE_RE = re.compile(r"^\s*(\d{1,2})/(\d{1,2})/(\d{4})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*([AaPp][Mm])?\s*$")
+
+
+def parse_visit_value(value, house_id, label):
+    """Visit cells should be real Excel dates, but some are typed in as text
+    (like '9/28/2026 9:00AM'). Real dates pass straight through; text that
+    looks like a date is converted, with a note so it's visible; anything
+    else comes back as None. Returns a naive local (PDT) datetime or None."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    match = TEXT_VISIT_DATE_RE.match(str(value))
+    if match:
+        month, day, year, hour, minute, second, meridiem = match.groups()
+        hour = int(hour)
+        if meridiem and hour <= 12:
+            if meridiem.lower() == "pm" and hour < 12:
+                hour += 12
+            elif meridiem.lower() == "am" and hour == 12:
+                hour = 0
+        try:
+            parsed = datetime(int(year), int(month), int(day), hour, int(minute), int(second or 0))
+        except ValueError:
+            parsed = None
+        if parsed:
+            print(f"House {house_id}: {label} was typed as text ({value!r}) in the spreadsheet -- read it as {parsed:%Y-%m-%d %H:%M} PDT")
+            return parsed
+    print(f"House {house_id}: {label} isn't a real date in the spreadsheet (got {value!r} instead) -- treating it as missing")
+    return None
+
+
 def build_house_characteristics(source_file, output_folder, house_filter=None):
     if openpyxl is None:
         print("openpyxl is required for this -- install it with: pip install openpyxl")
         sys.exit(1)
     wb = openpyxl.load_workbook(source_file, data_only=True)
     ws = wb["Sheet1"]
-    header_row = [cell.value for cell in ws[2]]
+    header_row_number = find_house_charac_header_row(ws)
+    header_row = [cell.value for cell in ws[header_row_number]]
 
     col_indexes = {}
     for idx, raw_header in enumerate(header_row):
@@ -839,14 +901,15 @@ def build_house_characteristics(source_file, output_folder, house_filter=None):
             print(f"Note: unmapped House_charac column found: {raw_header!r} -- skipped")
 
     rows_out = []
-    for row in ws.iter_rows(min_row=3, values_only=True):
+    for row in ws.iter_rows(min_row=header_row_number + 1, values_only=True):
         if row[0] is None:
             continue
         record = {}
         for clean_name, idx in col_indexes.items():
             val = row[idx] if idx < len(row) else None
             if clean_name.startswith("visit_") and val is not None:
-                val = val.strftime("%Y-%m-%d %H:%M:%S")
+                val = parse_visit_value(val, row[0], clean_name)
+                val = val.strftime("%Y-%m-%d %H:%M:%S") if val else None
             record[clean_name] = val if val is not None else ""
         if house_filter and record.get("house_id") not in house_filter:
             continue
@@ -980,19 +1043,18 @@ def load_visit_dates(house_charac_file):
     """Returns house_id -> [visit1_dt, visit2_dt, visit3_dt or None], all in true UTC."""
     wb = openpyxl.load_workbook(house_charac_file, data_only=True)
     ws = wb["Sheet1"]
-    header_row = [cell.value for cell in ws[2]]
+    header_row_number = find_house_charac_header_row(ws)
+    header_row = [cell.value for cell in ws[header_row_number]]
     idx = {name: i for i, name in enumerate(header_row) if name in ("House", "Visit 1", "Visit 2", "Visit 3")}
 
     def to_utc(v, house_id, label):
+        v = parse_visit_value(v, house_id, label)
         if v is None:
-            return None
-        if not isinstance(v, datetime):
-            print(f"House {house_id}: {label} isn't a real date in the spreadsheet (got {v!r} instead) -- treating it as missing")
             return None
         return v.replace(tzinfo=PDT).astimezone(timezone.utc).replace(tzinfo=None)
 
     visits = {}
-    for row in ws.iter_rows(min_row=3, values_only=True):
+    for row in ws.iter_rows(min_row=header_row_number + 1, values_only=True):
         house_id = row[idx["House"]] if "House" in idx else None
         if not house_id:
             continue
@@ -1086,7 +1148,12 @@ def process_house(house_num, week_groups, house_charac_file, output_folder, sens
     deduped_rows = []
     dupes_removed = defaultdict(int)
     for dt, phase, instrument, var, val, unit, qc in out_rows:
-        key = (dt, instrument, var)
+        # Aranet exports from the PRE and POST downloads overlap, and the same
+        # reading can be stamped a second apart in each (house 8: :05 vs :06),
+        # so compare Aranet to the minute. Readings are 10 minutes apart, so
+        # two different readings can't land in the same minute.
+        key_time = dt.replace(second=0, microsecond=0) if instrument == "Aranet" else dt
+        key = (key_time, instrument, var)
         if key in seen:
             dupes_removed[instrument] += 1
             continue

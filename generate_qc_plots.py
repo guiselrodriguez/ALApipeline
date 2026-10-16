@@ -24,6 +24,8 @@ import openpyxl
 import pandas as pd
 import matplotlib.pyplot as plt
 
+from process_hbrl_data import find_house_charac_header_row, parse_visit_value
+
 PDT_OFFSET = timedelta(hours=7)
 
 
@@ -32,11 +34,12 @@ def get_stove_install_time(house_charac_file, house_id):
     when the house received the induction stove."""
     wb = openpyxl.load_workbook(house_charac_file, data_only=True)
     ws = wb["Sheet1"]
-    header_row = [cell.value for cell in ws[2]]
+    header_row_number = find_house_charac_header_row(ws)
+    header_row = [cell.value for cell in ws[header_row_number]]
     idx = {name: i for i, name in enumerate(header_row) if name in ("House", "Visit 2")}
-    for row in ws.iter_rows(min_row=3, values_only=True):
+    for row in ws.iter_rows(min_row=header_row_number + 1, values_only=True):
         if row[idx["House"]] == house_id:
-            v2 = row[idx["Visit 2"]]
+            v2 = parse_visit_value(row[idx["Visit 2"]], house_id, "Visit 2")
             return v2 - PDT_OFFSET if v2 else None
     return None
 
