@@ -207,6 +207,8 @@ def discover_groups(folder):
                     guessed_side = "left"
                 elif "right" in source_base_lower:
                     guessed_side = "right"
+                elif "center" in source_base_lower:
+                    guessed_side = "center"
                 else:
                     guessed_side = None
                 entry = (guessed_side, source)
@@ -333,6 +335,8 @@ def _read_geocene_raw_folder(folder, source_name_hint=None):
             side = "left"
         elif "right" in hint_lower:
             side = "right"
+        elif "center" in hint_lower:
+            side = "center"
 
     if side is None:
         missions_path = os.path.join(folder, "missions.csv")
@@ -612,7 +616,7 @@ def parse_kestrel(path):
     return rows
 
 
-ARANET_TIMESTAMP_FORMATS = ("%d/%m/%Y %I:%M:%S %p", "%d/%m/%y %I:%M %p", "%d/%m/%y %I:%M:%S %p", "%d/%m/%Y %I:%M %p")
+ARANET_TIMESTAMP_FORMATS = ("%d/%m/%Y %I:%M:%S %p", "%d/%m/%y %I:%M %p", "%d/%m/%y %I:%M:%S %p", "%d/%m/%Y %I:%M %p", "%d/%m/%Y %H:%M", "%d/%m/%Y %H:%M:%S")
 
 
 def parse_aranet(path):
@@ -1149,10 +1153,11 @@ def process_house(house_num, week_groups, house_charac_file, output_folder, sens
     dupes_removed = defaultdict(int)
     for dt, phase, instrument, var, val, unit, qc in out_rows:
         # Aranet exports from the PRE and POST downloads overlap, and the same
-        # reading can be stamped a second apart in each (house 8: :05 vs :06),
-        # so compare Aranet to the minute. Readings are 10 minutes apart, so
-        # two different readings can't land in the same minute.
-        key_time = dt.replace(second=0, microsecond=0) if instrument == "Aranet" else dt
+        # reading can be stamped a few seconds or minutes apart in each (house 8:
+        # one second, house 10: three minutes), so compare Aranet to its 10-minute
+        # reading slot. Readings are 10 minutes apart, so two different readings
+        # can't share a slot.
+        key_time = dt.replace(minute=dt.minute // 10 * 10, second=0, microsecond=0) if instrument == "Aranet" else dt
         key = (key_time, instrument, var)
         if key in seen:
             dupes_removed[instrument] += 1

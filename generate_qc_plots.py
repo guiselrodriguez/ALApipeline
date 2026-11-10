@@ -40,7 +40,7 @@ def get_stove_install_time(house_charac_file, house_id):
     for row in ws.iter_rows(min_row=header_row_number + 1, values_only=True):
         if row[idx["House"]] == house_id:
             v2 = parse_visit_value(row[idx["Visit 2"]], house_id, "Visit 2")
-            return v2 - PDT_OFFSET if v2 else None
+            return v2 if v2 else None  # the spreadsheet time is already local (PDT), same as the plot's time axis
     return None
 
 

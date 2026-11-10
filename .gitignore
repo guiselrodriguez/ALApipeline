@@ -2,3 +2,9 @@
 *.xlsx
 *.csv
 __pycache__/
+
+boxplots*/
+io_plots*/
+no2_*/
+ogawa_plots/
+qc_plots/
